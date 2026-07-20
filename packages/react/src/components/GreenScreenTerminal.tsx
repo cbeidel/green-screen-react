@@ -612,14 +612,22 @@ export const GreenScreenTerminal = forwardRef<GreenScreenTerminalHandle, GreenSc
     // measured the same way above. Falls back to 21 if rows aren't found yet.
     let rowTop = rect.top + (parseFloat(cs.paddingTop) || 0);
     let ROW_HEIGHT = 21;
-    const rowHost = (contentEl.firstElementChild && contentEl.firstElementChild.children.length >= 20)
-      ? contentEl.firstElementChild : contentEl;
-    const rowKids = rowHost.children;
-    if (rowKids.length >= 2) {
-      const r0 = rowKids[0].getBoundingClientRect();
-      const r1 = rowKids[1].getBoundingClientRect();
+    // Find the rendered row <div>s by their inline `white-space: pre` (each row
+    // carries it). querySelectorAll walks through any wrapper nesting (e.g. the
+    // transient `gs-fade-in` boot wrapper), so the measurement is robust to the
+    // exact DOM shape — a firstElementChild-only check silently missed the rows
+    // and fell back to 21.
+    const rowEls = Array.from(contentEl.querySelectorAll('div'))
+      .filter((d) => /white-space:\s*pre/.test(d.getAttribute('style') || ''));
+    if (rowEls.length >= 2) {
+      const r0 = rowEls[0].getBoundingClientRect();
+      const r1 = rowEls[1].getBoundingClientRect();
       rowTop = r0.top;
       if (r1.top - r0.top > 0) ROW_HEIGHT = r1.top - r0.top;
+    } else if (rowEls.length === 1) {
+      const r0 = rowEls[0].getBoundingClientRect();
+      rowTop = r0.top;
+      if (r0.height > 0) ROW_HEIGHT = r0.height;
     }
 
     const clickedRow = Math.floor((e.clientY - rowTop) / ROW_HEIGHT);
