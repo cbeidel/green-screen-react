@@ -599,14 +599,30 @@ export const GreenScreenTerminal = forwardRef<GreenScreenTerminalHandle, GreenSc
     const rect = contentEl.getBoundingClientRect();
     const cs = window.getComputedStyle(contentEl);
     const padLeft = parseFloat(cs.paddingLeft) || 0;
-    const padTop = parseFloat(cs.paddingTop) || 0;
     const x = e.clientX - rect.left - padLeft;
-    const y = e.clientY - rect.top - padTop;
-    const ROW_HEIGHT = 21;
     const charWidth = charWidthRef.current;
     if (!charWidth) return;
 
-    const clickedRow = Math.floor(y / ROW_HEIGHT);
+    // Rows: measure the ACTUAL on-screen row pitch + origin from the rendered
+    // row <div>s instead of hardcoding the logical 21px. The terminal is often
+    // CSS-scaled by a parent (panel fit / zoom), so the logical row height does
+    // not match on screen — a hardcoded 21 maps clicks to the wrong host row,
+    // worsening further down the screen. Using the first row's measured top as
+    // the origin also removes the padded-box scaling error. charWidth is already
+    // measured the same way above. Falls back to 21 if rows aren't found yet.
+    let rowTop = rect.top + (parseFloat(cs.paddingTop) || 0);
+    let ROW_HEIGHT = 21;
+    const rowHost = (contentEl.firstElementChild && contentEl.firstElementChild.children.length >= 20)
+      ? contentEl.firstElementChild : contentEl;
+    const rowKids = rowHost.children;
+    if (rowKids.length >= 2) {
+      const r0 = rowKids[0].getBoundingClientRect();
+      const r1 = rowKids[1].getBoundingClientRect();
+      rowTop = r0.top;
+      if (r1.top - r0.top > 0) ROW_HEIGHT = r1.top - r0.top;
+    }
+
+    const clickedRow = Math.floor((e.clientY - rowTop) / ROW_HEIGHT);
     const clickedCol = Math.floor(x / charWidth);
 
     if (clickedRow < 0 || clickedRow >= (screenData.rows || 24) ||
