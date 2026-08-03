@@ -1141,6 +1141,7 @@ export class TN5250Parser {
       row,
       col,
       length: fieldLength,
+      lengthSource: fieldLength > 0 ? 'declared' : undefined,
       ffw1: inputField ? ffw1 : 0x20, // BYPASS bit for output fields
       ffw2,
       fcw1,
@@ -1183,6 +1184,18 @@ export class TN5250Parser {
         existing.ffw2 = ffw2;
         existing.attribute = fieldDisplayAttr;
         existing.rawAttrByte = rawAttrByte;
+        // The SF order carries the host's DECLARED width. A field synthesized
+        // earlier from a bare SBA+attribute holds length 0, and dropping the
+        // declared length here left it to calculateFieldLengths, which measures
+        // the gap to the next field — so a 6-char date field on a sparse row
+        // reported 43. Integrators sized their input against that and the host
+        // silently truncated the overflow (LegacyBridge, 2026-08-03: an 8-digit
+        // date landed as the wrong YEAR with no error raised).
+        if (fieldLength > 0) {
+          existing.length = fieldLength;
+          existing.lengthSource = 'declared';
+        }
+        existing.synthetic = undefined;
       } else {
         this.screen.fields.push(field);
       }
@@ -1621,7 +1634,10 @@ export class TN5250Parser {
       // If the field already has an explicit length from SF order, keep it
       if (current.length > 0) continue;
 
-      // Otherwise infer length from adjacent field positions (bare field attributes)
+      // Otherwise infer length from adjacent field positions (bare field
+      // attributes). This is a GAP measurement, not the host's field width —
+      // stamped so consumers can refuse to size input against it.
+      current.lengthSource = 'inferred';
       const currentStart = this.screen.offset(current.row, current.col);
 
       if (i + 1 < fields.length) {

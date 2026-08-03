@@ -22,8 +22,16 @@ export interface Field {
   row: number;
   /** 0-based column index */
   col: number;
-  /** Field length in characters */
+  /** Field length in characters.
+   *  When `length_source` is absent this is an INFERRED upper bound (the gap to
+   *  the next field), not the host's field width. */
   length: number;
+  /** Present (`'declared'`) only when `length` is the width the host sent in its
+   *  SF order. Absent means the width was measured from field spacing, which
+   *  routinely over-reports — a trailing field infers to the screen edge. Never
+   *  size input against an undeclared length: a 5250 host silently keeps only
+   *  the first N characters of an over-long write. */
+  length_source?: 'declared';
   /** Whether the field accepts user input */
   is_input: boolean;
   /** Whether the field is protected (read-only) */

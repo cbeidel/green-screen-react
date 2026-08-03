@@ -64,6 +64,19 @@ export interface FieldDef {
    *  Input-vs-protected inference is heuristic — validated in
    *  calculateFieldLengths against same-row termination. */
   synthetic?: boolean;
+  /** Where `length` came from.
+   *
+   *  'declared' — the 2-byte length the host sent in its SF order. Authoritative:
+   *  it is the width the host program will actually accept.
+   *
+   *  'inferred' — calculateFieldLengths measured the gap to the next field
+   *  because no SF length was available. An upper bound, often far larger than
+   *  the real field (a trailing field infers everything to the screen edge).
+   *
+   *  Integrators MUST NOT size input against an inferred length: a host silently
+   *  keeps only the first N characters of an over-long write, so an inflated
+   *  width turns a rejected value into a corrupted one. */
+  lengthSource?: 'declared' | 'inferred';
   /** Part of a continued (multi-line wrapping) field group. Per lib5250 field.h:66-70. */
   continuous?: boolean;
   /** First subfield of a continued field group (FCW 0x8601). */
@@ -928,6 +941,10 @@ export class ScreenBuffer {
         row: f.row,
         col: f.col,
         length: f.length,
+        // Provenance of `length`. Emitted only when the host DECLARED it, so a
+        // consumer can size input against a real width and fall back to
+        // treating `length` as an upper bound otherwise.
+        length_source: f.lengthSource === 'declared' ? 'declared' : undefined,
         is_input: isInput,
         is_protected: !isInput,
         is_highlighted: this.isHighlighted(f) || undefined,

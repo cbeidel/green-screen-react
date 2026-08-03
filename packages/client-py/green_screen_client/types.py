@@ -42,6 +42,14 @@ class Field:
     length: int
     is_input: bool
     is_protected: bool
+    # Provenance of ``length``. ``"declared"`` means the host sent this width in
+    # its SF order — the width its program will actually accept. Absent means the
+    # width was MEASURED from field spacing and is only an upper bound (a
+    # trailing field measures to the screen edge). Never size input against an
+    # undeclared length: a 5250 host silently keeps the first N characters of an
+    # over-long write, so an inflated width turns a value the host would have
+    # rejected into one it accepts and corrupts.
+    length_source: Optional[str] = None
     is_highlighted: Optional[bool] = None
     is_reverse: Optional[bool] = None
     is_underscored: Optional[bool] = None
