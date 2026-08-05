@@ -933,6 +933,14 @@ export class ScreenBuffer {
         else if (adjustBits === 0x07) auto_adjust = 'mandatory_fill';
       }
       const mandatory_entry = isInput && (f.ffw2 & 0x08) !== 0;
+      // FFW2 bit 0x40 = FIELD EXIT REQUIRED (DDS CHECK(ER) family): the host
+      // rejects leaving the field by plain data-fill — a Field Exit-class key
+      // (or the field filling under AUTO-ENTER) must end it. Surfaced so a
+      // client can plan a FieldExit keystroke instead of learning the
+      // requirement from a rejected submit.
+      const field_exit_required = isInput && (f.ffw2 & 0x40) !== 0;
+      // FFW1 bit 0x10 = DUP key allowed in this field.
+      const dup_enable = isInput && (f.ffw1 & 0x10) !== 0;
       // FFW2 bit 0x80 = AUTO-ENTER (DDS AUTO(RA/RAB)): the field implicitly sends
       // ENTER once it fills, so a client that walks fields with explicit TAB must
       // NOT add a TAB after it (the host already advanced). Protocol-generic.
@@ -965,6 +973,8 @@ export class ScreenBuffer {
         auto_adjust,
         mandatory_entry: mandatory_entry || undefined,
         auto_enter: auto_enter || undefined,
+        field_exit_required: field_exit_required || undefined,
+        dup_enable: dup_enable || undefined,
         // MDT bit — only meaningful for input fields; leave undefined on
         // protected fields to keep the wire payload minimal.
         modified: isInput && f.modified ? true : undefined,

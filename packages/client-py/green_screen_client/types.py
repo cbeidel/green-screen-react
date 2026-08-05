@@ -78,6 +78,12 @@ class Field:
     # FFW2 auto-enter bit (DDS AUTO(RA/RAB)) — the field implicitly sends ENTER
     # once it fills; a client walking fields with TAB must not add a TAB after it.
     auto_enter: Optional[bool] = None
+    # FFW2 field-exit-required bit (DDS CHECK(ER) family) — the host rejects
+    # leaving this field by plain data-fill; plan a FieldExit keystroke after
+    # the value instead of learning the requirement from a rejected submit.
+    field_exit_required: Optional[bool] = None
+    # FFW1 DUP-enable bit — the DUP key is allowed in this field.
+    dup_enable: Optional[bool] = None
 
     @classmethod
     def from_wire(cls, data: Dict[str, Any]) -> "Field":
@@ -107,6 +113,8 @@ class Field:
             mandatory_entry=data.get("mandatory_entry"),
             auto_adjust=data.get("auto_adjust"),
             auto_enter=data.get("auto_enter"),
+            field_exit_required=data.get("field_exit_required"),
+            dup_enable=data.get("dup_enable"),
         )
 
 

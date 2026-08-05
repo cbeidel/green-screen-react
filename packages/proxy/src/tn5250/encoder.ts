@@ -488,12 +488,14 @@ export class TN5250Encoder {
     const value = this.screen.getFieldValue(field);
     const trimmed = value.replace(/\s+$/, '');
 
+    // FFW2 ADJUST bits per the 5250 Functions Reference (and this package's
+    // own wire projection in screen.ts): 0x05 = right-adjust zero-fill,
+    // 0x06 = right-adjust blank-fill. 0x07 is MANDATORY FILL — a validation
+    // rule, not an adjust instruction — so it must not pad.
     const adjustType = field.ffw2 & FFW.RIGHT_ADJUST_MASK;
-    if (adjustType !== 0 && trimmed.length > 0 && trimmed.length < field.length) {
-      let padChar = ' ';
-      if (adjustType === 1 || adjustType === 3) padChar = '0'; // zero fill
-      // adjustType 2, 5 = blank fill (padChar stays ' ')
-
+    if ((adjustType === 0x05 || adjustType === 0x06)
+        && trimmed.length > 0 && trimmed.length < field.length) {
+      const padChar = adjustType === 0x05 ? '0' : ' ';
       const adjusted = padChar.repeat(field.length - trimmed.length) + trimmed;
       this.screen.setFieldValue(field, adjusted);
     }

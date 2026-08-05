@@ -120,6 +120,16 @@ export interface Field {
    */
   auto_enter?: boolean;
   /**
+   * Field Exit Required (FFW2 bit 0x40, DDS CHECK(ER) family) — the host
+   * rejects leaving this field by plain data-fill; a Field Exit-class key must
+   * end it (or the field must fill under auto_enter). Clients that position
+   * the cursor and type directly should plan a FieldExit keystroke after the
+   * value instead of discovering the requirement from a rejected submit.
+   */
+  field_exit_required?: boolean;
+  /** DUP key allowed in this field (FFW1 bit 0x10). */
+  dup_enable?: boolean;
+  /**
    * Modified Data Tag (MDT) — true when the operator has typed into this
    * input field since the last host read. Mirrors the 5250 per-field MDT bit
    * (set on any keystroke into the field, cleared by CC1 `reset MDT` mask or
