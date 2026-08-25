@@ -291,7 +291,11 @@ export class TN5250Encoder {
     for (let i = 0; i < value.length; i++) {
       // Preserve NUL characters (stored in the buffer as char code 0).
       const code = value.charCodeAt(i);
-      buf[i] = code === 0 ? 0x00 : charToEbcdic(value[i]);
+      // The session code page MUST thread here (mirrors tn3270/encoder.ts):
+      // without it a cp290 (Japan katakana) session silently encoded typed
+      // text through the CP37 table — decode honored the code page, encode
+      // did not, so round-tripped characters landed as the wrong bytes.
+      buf[i] = code === 0 ? 0x00 : charToEbcdic(value[i], this.screen.codePage);
     }
     return buf;
   }
