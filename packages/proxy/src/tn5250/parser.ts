@@ -513,6 +513,23 @@ export class TN5250Parser {
         this.screen.setAttrAt(currentAddr, currentAttr);
         this.screen.setExtAttrAt(currentAddr, snapExt());
         this.screen.dbcsCont[currentAddr] = false;
+        this.screen.dbcsShift[currentAddr] = 0;
+      }
+      currentAddr++;
+      if (currentAddr >= this.screen.size) currentAddr = 0;
+    };
+
+    // Helper: write an SO/SI shift-control cell. Renders as a space (per
+    // IBM PCOMM column alignment) but keeps its identity in dbcsShift so
+    // the encoder can re-emit the original 0x0E/0x0F on the wire instead
+    // of a 0x40 space — without this the field loses round-trip identity.
+    const writeShift = (kind: 1 | 2): void => {
+      if (currentAddr < this.screen.size) {
+        this.screen.setCharAt(currentAddr, ' ');
+        this.screen.setAttrAt(currentAddr, currentAttr);
+        this.screen.setExtAttrAt(currentAddr, snapExt());
+        this.screen.dbcsCont[currentAddr] = false;
+        this.screen.dbcsShift[currentAddr] = kind;
       }
       currentAddr++;
       if (currentAddr >= this.screen.size) currentAddr = 0;
@@ -526,6 +543,7 @@ export class TN5250Parser {
         this.screen.setAttrAt(currentAddr, currentAttr);
         this.screen.setExtAttrAt(currentAddr, snapExt());
         this.screen.dbcsCont[currentAddr] = false;
+        this.screen.dbcsShift[currentAddr] = 0;
       }
       currentAddr++;
       if (currentAddr >= this.screen.size) currentAddr = 0;
@@ -534,6 +552,7 @@ export class TN5250Parser {
         this.screen.setAttrAt(currentAddr, currentAttr);
         this.screen.setExtAttrAt(currentAddr, snapExt());
         this.screen.dbcsCont[currentAddr] = true;
+        this.screen.dbcsShift[currentAddr] = 0;
       }
       currentAddr++;
       if (currentAddr >= this.screen.size) currentAddr = 0;
@@ -911,14 +930,14 @@ export class TN5250Parser {
             // a space to preserve column alignment (matches IBM PCOMM).
             dbcsMode = true;
             dbcsPending = -1;
-            writeChar(' ');
+            writeShift(1);
             pos++;
           } else if (byte === SI && dbcsMode) {
             // Shift-In: exit DBCS mode, return to SBCS. Any orphan pending
             // byte is discarded (malformed stream). SI also occupies a cell.
             dbcsMode = false;
             dbcsPending = -1;
-            writeChar(' ');
+            writeShift(2);
             pos++;
           } else if (dbcsMode) {
             // Collect DBCS byte pairs. Each pair renders as one full-width

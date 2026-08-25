@@ -1,6 +1,7 @@
 import { ScreenBuffer, FieldDef } from './screen.js';
 import { TELNET, KEY_TO_AID, AID, FFW, CMD, RECORD_H, RECORD_OPCODE } from './constants.js';
 import { charToEbcdic, EBCDIC_SPACE } from '../encoding/ebcdic.js';
+import { SI, SO, encodeDbcsPair, isDbcsGlyph } from '../encoding/ebcdic-jp.js';
 import { aidTransmitsData } from './command-keys.js';
 
 /**
@@ -267,7 +268,6 @@ export class TN5250Encoder {
     return Buffer.concat(pieces);
   }
 
-  /** Encode one single field's content to EBCDIC (no continuation walk). */
   /**
    * Check the SOH header key mask to determine if field data should be
    * sent for the given AID key. Per lib5250 dbuffer.c:193-318.
@@ -284,20 +284,51 @@ export class TN5250Encoder {
     return aidTransmitsData(this.screen.headerData, aidByte);
   }
 
-  /** Encode one single field's content to EBCDIC (no continuation walk). */
+  /**
+   * Encode one single field's content to EBCDIC (no continuation walk).
+   *
+   * Walks CELLS, not the joined string, so DBCS content re-encodes with
+   * wire identity: an SO/SI cell (dbcsShift) emits 0x0E/0x0F, a glyph
+   * whose next cell is a continuation emits its byte pair (via the
+   * decode registry's mirror), and total bytes === cell count by
+   * construction. SBCS-only fields produce byte-identical output to the
+   * previous string walk.
+   */
   private encodeSingleField(field: FieldDef): Buffer {
-    const value = this.screen.getFieldValue(field);
-    const buf = Buffer.alloc(value.length);
-    for (let i = 0; i < value.length; i++) {
+    const start = this.screen.offset(field.row, field.col);
+    const out: number[] = [];
+    let pairConsumedNext = false;
+    for (let i = 0; i < field.length && start + i < this.screen.size; i++) {
+      const addr = start + i;
+      const shift = this.screen.dbcsShift[addr];
+      if (shift === 1) { out.push(SO); continue; }
+      if (shift === 2) { out.push(SI); continue; }
+      if (this.screen.dbcsCont[addr]) {
+        // Second half of a pair — its glyph already emitted both bytes.
+        // An orphan continuation (field boundary split a pair) still must
+        // hold its cell on the wire.
+        if (pairConsumedNext) { pairConsumedNext = false; continue; }
+        out.push(0x40);
+        continue;
+      }
+      pairConsumedNext = false;
+      const ch = this.screen.buffer[addr];
+      if (i + 1 < field.length && this.screen.dbcsCont[addr + 1]) {
+        // DBCS space keeps the two-cell layout for unmapped glyphs.
+        const pair = encodeDbcsPair(ch) ?? [0x40, 0x40];
+        out.push(pair[0], pair[1]);
+        pairConsumedNext = true;
+        continue;
+      }
       // Preserve NUL characters (stored in the buffer as char code 0).
-      const code = value.charCodeAt(i);
       // The session code page MUST thread here (mirrors tn3270/encoder.ts):
       // without it a cp290 (Japan katakana) session silently encoded typed
       // text through the CP37 table — decode honored the code page, encode
       // did not, so round-tripped characters landed as the wrong bytes.
-      buf[i] = code === 0 ? 0x00 : charToEbcdic(value[i], this.screen.codePage);
+      const code = ch.charCodeAt(0);
+      out.push(code === 0 ? 0x00 : charToEbcdic(ch, this.screen.codePage));
     }
-    return buf;
+    return Buffer.from(out);
   }
 
   /** Build an empty 10-byte record (no data) with the given flags/opcode. */
@@ -457,9 +488,23 @@ export class TN5250Encoder {
     const fieldStart = this.screen.offset(field.row, field.col);
     let cursorOffset = this.screen.offset(this.screen.cursorRow, this.screen.cursorCol);
     const fieldEnd = fieldStart + field.length;
+    const dbcsCapable = this.screen.isDbcsField(field);
 
     for (const ch of text) {
       if (cursorOffset >= fieldEnd) break; // Field is full
+
+      if (dbcsCapable && isDbcsGlyph(ch)) {
+        cursorOffset = this.insertDbcsGlyph(field, ch, cursorOffset, fieldEnd);
+        if (cursorOffset < 0) break; // glyph did not fit
+        continue;
+      }
+
+      // An SBCS character typed while the cursor rests on a run's SI
+      // belongs AFTER the run — overwriting the SI would unterminate it.
+      if (dbcsCapable && this.screen.dbcsShift[cursorOffset] === 2) {
+        cursorOffset++;
+        if (cursorOffset >= fieldEnd) break;
+      }
 
       // In insert mode, shift existing content right to make room
       // (per lib5250 dbuffer.c:790-835 dbuffer_ins)
@@ -469,6 +514,9 @@ export class TN5250Encoder {
         }
       }
       this.screen.buffer[cursorOffset] = ch;
+      // Cell-honest: an SBCS character overwrites any DBCS debris marks.
+      this.screen.dbcsCont[cursorOffset] = false;
+      this.screen.dbcsShift[cursorOffset] = 0;
       cursorOffset++;
     }
 
@@ -482,12 +530,73 @@ export class TN5250Encoder {
   }
 
   /**
+   * Insert one DBCS glyph at cursorOffset in a DBCS-capable field.
+   *
+   * Shifted fields (ideographic open/either): typing the first glyph
+   * creates the 4-cell run SO+glyph+cont+SI; typing at an existing run's
+   * SI appends glyph+cont before it (SI slides right 2 cells). Bare
+   * fields (ideographic only/data): glyph+cont, no shift cells.
+   *
+   * Returns the new cursor offset (positioned ON the SI for shifted runs,
+   * so consecutive glyphs chain into one run), or -1 if it did not fit.
+   */
+  private insertDbcsGlyph(
+    field: FieldDef,
+    ch: string,
+    cursorOffset: number,
+    fieldEnd: number,
+  ): number {
+    const s = this.screen;
+    const writeCell = (addr: number, c: string, cont: boolean, shift: number): void => {
+      s.buffer[addr] = c;
+      s.dbcsCont[addr] = cont;
+      s.dbcsShift[addr] = shift;
+    };
+
+    if (!s.fieldUsesShiftMarks(field)) {
+      if (cursorOffset + 2 > fieldEnd) return -1;
+      writeCell(cursorOffset, ch, false, 0);
+      writeCell(cursorOffset + 1, '', true, 0);
+      return cursorOffset + 2;
+    }
+
+    // Append inside an existing run: cursor sits on the run's SI cell.
+    if (s.dbcsShift[cursorOffset] === 2) {
+      if (cursorOffset + 3 > fieldEnd) return -1;
+      writeCell(cursorOffset, ch, false, 0);
+      writeCell(cursorOffset + 1, '', true, 0);
+      writeCell(cursorOffset + 2, ' ', false, 2);
+      return cursorOffset + 2; // cursor lands on the moved SI
+    }
+
+    // Create a fresh 4-cell run: SO + glyph + continuation + SI.
+    if (cursorOffset + 4 > fieldEnd) return -1;
+    writeCell(cursorOffset, ' ', false, 1);
+    writeCell(cursorOffset + 1, ch, false, 0);
+    writeCell(cursorOffset + 2, '', true, 0);
+    writeCell(cursorOffset + 3, ' ', false, 2);
+    return cursorOffset + 3; // cursor lands on the SI
+  }
+
+  /**
    * Field Exit: right-adjust field value per FFW2 bits and mark modified.
    * Does NOT advance cursor — caller should handle that (e.g., Tab).
    */
   fieldExit(): boolean {
     const field = this.screen.getFieldAtCursor();
     if (!field || !this.screen.isInputField(field)) return false;
+
+    // Cell-honest guard: right-adjust is a character-cell shuffle that
+    // would split glyph/continuation pairs and orphan SO/SI cells — and
+    // adjust semantics are numeric/Latin anyway. DBCS content keeps its
+    // layout; only the MDT is set.
+    const start = this.screen.offset(field.row, field.col);
+    for (let i = 0; i < field.length && start + i < this.screen.size; i++) {
+      if (this.screen.dbcsCont[start + i] || this.screen.dbcsShift[start + i]) {
+        this.screen.setFieldMdt(field);
+        return true;
+      }
+    }
 
     const value = this.screen.getFieldValue(field);
     const trimmed = value.replace(/\s+$/, '');
