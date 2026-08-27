@@ -260,7 +260,7 @@ export const GreenScreenTerminal = forwardRef<GreenScreenTerminalHandle, GreenSc
   onWindowClose,
   persistFocus = true,
   alwaysFocused = false,
-  alwaysCursor = true,
+  alwaysCursor = false,
   theme = 'modern',
   className,
   style,
