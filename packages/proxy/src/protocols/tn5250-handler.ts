@@ -62,7 +62,7 @@ export class TN5250Handler extends ProtocolHandler {
     // hiragana/katakana/symbols render without further setup. A full
     // Kanji table can be layered on top via `registerDbcsTable(...)`.
     if (this.screen.codePage === 'cp290') {
-      const { registerBuiltinDbcsTable } = await import('../tn5250/ebcdic-jp-builtin.js');
+      const { registerBuiltinDbcsTable } = await import('../encoding/ebcdic-jp-builtin.js');
       registerBuiltinDbcsTable();
     }
 
@@ -108,6 +108,15 @@ export class TN5250Handler extends ProtocolHandler {
    * almost immediately once it sees the host-side SIGNOFF, whereas a bare
    * TCP FIN leaves the job hanging until QDEVRCYACN picks it up.
    */
+  override get traits() {
+    return { inputModel: 'block' as const, hasMdt: true };
+  }
+
+  /** Capability alias — the protocol-agnostic graceful-exit seam. */
+  override attemptGracefulExit(timeoutMs: number = 1500): Promise<boolean> {
+    return this.attemptSignOff(timeoutMs);
+  }
+
   async attemptSignOff(timeoutMs: number = 1500): Promise<boolean> {
     if (!this.connection.isConnected) return false;
 
@@ -727,6 +736,18 @@ export class TN5250Handler extends ProtocolHandler {
   }
 
   private onRecord(record: Buffer): void {
+    try {
+      this.parseRecordGuarded(record);
+    } catch (err) {
+      // A crafted/corrupt host record must not throw out of the socket 'data'
+      // handler (that would surface as an unhandled exception and drop the
+      // connection). Log and drop the offending record; the session stays up
+      // and the next well-formed record recovers the screen.
+      console.error(`[tn5250] dropped unparseable record (len=${record.length}): ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private parseRecordGuarded(record: Buffer): void {
     const klBefore = this.screen.keyboardLocked;
     const modified = this.parser.parseRecord(record);
 

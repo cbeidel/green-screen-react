@@ -42,11 +42,22 @@ class Field:
     length: int
     is_input: bool
     is_protected: bool
+    # Provenance of ``length``. ``"declared"`` means the host sent this width in
+    # its SF order — the width its program will actually accept. Absent means the
+    # width was MEASURED from field spacing and is only an upper bound (a
+    # trailing field measures to the screen edge). Never size input against an
+    # undeclared length: a 5250 host silently keeps the first N characters of an
+    # over-long write, so an inflated width turns a value the host would have
+    # rejected into one it accepts and corrupts.
+    length_source: Optional[str] = None
     is_highlighted: Optional[bool] = None
     is_reverse: Optional[bool] = None
     is_underscored: Optional[bool] = None
     is_non_display: Optional[bool] = None
     color: Optional[FieldColor] = None
+    # Numeric-only input field (3270 field-attribute NUMERIC bit; 5250
+    # exposes the richer shift_type instead).
+    is_numeric: Optional[bool] = None
     highlight_entry_attr: Optional[int] = None
     resequence: Optional[int] = None
     progression_id: Optional[int] = None
@@ -67,6 +78,12 @@ class Field:
     # FFW2 auto-enter bit (DDS AUTO(RA/RAB)) — the field implicitly sends ENTER
     # once it fills; a client walking fields with TAB must not add a TAB after it.
     auto_enter: Optional[bool] = None
+    # FFW2 field-exit-required bit (DDS CHECK(ER) family) — the host rejects
+    # leaving this field by plain data-fill; plan a FieldExit keystroke after
+    # the value instead of learning the requirement from a rejected submit.
+    field_exit_required: Optional[bool] = None
+    # FFW1 DUP-enable bit — the DUP key is allowed in this field.
+    dup_enable: Optional[bool] = None
 
     @classmethod
     def from_wire(cls, data: Dict[str, Any]) -> "Field":
@@ -81,6 +98,7 @@ class Field:
             is_underscored=data.get("is_underscored"),
             is_non_display=data.get("is_non_display"),
             color=data.get("color"),
+            is_numeric=data.get("is_numeric"),
             highlight_entry_attr=data.get("highlight_entry_attr"),
             resequence=data.get("resequence"),
             progression_id=data.get("progression_id"),
@@ -95,6 +113,8 @@ class Field:
             mandatory_entry=data.get("mandatory_entry"),
             auto_adjust=data.get("auto_adjust"),
             auto_enter=data.get("auto_enter"),
+            field_exit_required=data.get("field_exit_required"),
+            dup_enable=data.get("dup_enable"),
         )
 
 

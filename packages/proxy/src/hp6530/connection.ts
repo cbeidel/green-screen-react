@@ -1,6 +1,6 @@
 import * as net from 'net';
 import { EventEmitter } from 'events';
-import { TELNET } from '../tn5250/constants.js';
+import { TELNET } from '../net/telnet.js';
 import { TERMINAL_TYPE, CTRL } from './constants.js';
 
 export interface ConnectionEvents {
@@ -82,6 +82,9 @@ export class HP6530Connection extends EventEmitter {
 
         this.socket!.on('timeout', () => {
           this.emit('error', new Error('Connection timeout'));
+          // A socket timeout does NOT close the socket — destroy it so the
+          // half-open connection can't dangle (the 'close' handler then cleans up).
+          this.socket?.destroy();
         });
 
         this.socket!.on('data', (data: Buffer) => this.onData(data));

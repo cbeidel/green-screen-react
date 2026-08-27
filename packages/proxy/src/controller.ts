@@ -1,6 +1,6 @@
-import { createProtocolHandler, ProtocolHandler, TN5250Handler } from './protocols/index.js';
+import { createProtocolHandler, ProtocolHandler } from './protocols/index.js';
 import type { ProtocolType, ScreenData } from './protocols/index.js';
-import type { EbcdicCodePage } from './tn5250/ebcdic.js';
+import type { EbcdicCodePage } from './encoding/ebcdic.js';
 
 /**
  * Shared session controller that handles the WebSocket message protocol
@@ -76,7 +76,7 @@ export class SessionController {
     this.send({ type: 'status', data: { connected: true, status: 'connected', protocol, host } });
 
     // Auto-sign-in if credentials provided and handler supports it
-    if (username && password && this.handler instanceof TN5250Handler) {
+    if (username && password && this.handler.performAutoSignIn) {
       const result = await this.handler.performAutoSignIn(username, password);
       if (result) {
         this.send({ type: 'screen', data: result.screen });
@@ -134,17 +134,7 @@ export class SessionController {
     }
 
     // Local operations — respond immediately without waiting for host
-    const localKeys = [
-      'Tab', 'Backtab', 'TAB', 'BACKTAB',
-      'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown',
-      'LEFT', 'RIGHT', 'UP', 'DOWN',
-      'Home', 'HOME', 'End', 'END',
-      'Backspace', 'BACKSPACE', 'Delete', 'DELETE',
-      'Insert', 'INSERT',
-      'Reset', 'RESET',
-      'FieldExit', 'FIELD_EXIT', 'FIELDEXIT',
-    ];
-    if (localKeys.includes(key)) {
+    if (this.handler.isLocalKey(key)) {
       // Local buffer-modifying ops need full screen; cursor-only ops don't
       const bufferOps = ['Backspace', 'BACKSPACE', 'Delete', 'DELETE',
         'Insert', 'INSERT',
@@ -158,7 +148,10 @@ export class SessionController {
         this.send({ type: 'cursor', data: { cursor_row: sd.cursor_row, cursor_col: sd.cursor_col } });
       }
     } else {
-      await this.waitForScreen(3000);
+      // Stream protocols echo per-keystroke (or not at all, e.g. password
+      // prompts) — a long wait would stall typing, so cap the echo window.
+      const waitMs = this.handler.traits.inputModel === 'stream' ? 250 : 3000;
+      await this.waitForScreen(waitMs);
       this.send({ type: 'screen', data: this.handler.getScreenData() });
     }
   }
@@ -198,9 +191,9 @@ export class SessionController {
    * CPF1220 "device session limit" on IBM i with LMTDEVSSN=*YES.
    */
   async handleGracefulDisconnect(timeoutMs: number = 1500): Promise<void> {
-    if (this.handler && typeof (this.handler as any).attemptSignOff === 'function') {
+    if (this.handler?.attemptGracefulExit) {
       try {
-        await (this.handler as any).attemptSignOff(timeoutMs);
+        await this.handler.attemptGracefulExit(timeoutMs);
       } catch {
         // best-effort
       }

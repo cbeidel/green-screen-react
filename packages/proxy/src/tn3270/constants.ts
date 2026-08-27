@@ -1,6 +1,5 @@
-// === Telnet Constants (shared with TN5250) ===
-export { TELNET } from '../tn5250/constants.js';
-import { TELNET } from '../tn5250/constants.js';
+// === Telnet Constants (shared across protocols) ===
+export { TELNET } from '../net/telnet.js';
 
 // === 3270 Command Codes ===
 export const CMD3270 = {
@@ -38,12 +37,14 @@ export const ORDER3270 = {
 } as const;
 
 // === WCC (Write Control Character) bits ===
+// Per GA23-0059 (and x3270 ctlr.c): the previous table here had RESET_MDT
+// and the keyboard bit wrong — keyboard restore is 0x02, reset-MDT is 0x01.
 export const WCC = {
-  RESET_MDT: 0x02,           // Reset Modified Data Tags
-  RESET_KEYBOARD: 0x40,      // Reset keyboard lock
-  SOUND_ALARM: 0x04,         // Sound audible alarm
-  RESET_PARTITION: 0x01,     // Reset partition characteristics
+  RESET: 0x40,               // Reset partition characteristics
   START_PRINTER: 0x08,       // Start printer
+  SOUND_ALARM: 0x04,         // Sound audible alarm
+  KEYBOARD_RESTORE: 0x02,    // Unlock keyboard + reset AID
+  RESET_MDT: 0x01,           // Reset Modified Data Tags
 } as const;
 
 // === 3270 AID (Attention Identifier) bytes ===
@@ -201,6 +202,21 @@ export const SCREEN3270 = {
   MODEL5_COLS: 132,
 } as const;
 
+/**
+ * Screen dimensions for a 3278/3279 terminal-type string. The model digit
+ * (2-5) selects the ALTERNATE size (Erase/Write Alternate); the default
+ * size is always Model 2's 24x80.
+ */
+export function dimensionsFor3270Type(terminalType: string): { rows: number; cols: number } {
+  const m = /^IBM-327[89]-([2-5])(?:-E)?$/i.exec(terminalType.trim());
+  switch (m?.[1]) {
+    case '3': return { rows: SCREEN3270.MODEL3_ROWS, cols: SCREEN3270.MODEL3_COLS };
+    case '4': return { rows: SCREEN3270.MODEL4_ROWS, cols: SCREEN3270.MODEL4_COLS };
+    case '5': return { rows: SCREEN3270.MODEL5_ROWS, cols: SCREEN3270.MODEL5_COLS };
+    default:  return { rows: SCREEN3270.MODEL2_ROWS, cols: SCREEN3270.MODEL2_COLS };
+  }
+}
+
 // Terminal type strings
 export const TERMINAL_TYPE_3270 = 'IBM-3278-2';          // Model 2 (24x80)
 export const TERMINAL_TYPE_3270_M3 = 'IBM-3278-3';       // Model 3 (32x80)
@@ -236,7 +252,13 @@ export const FA = {
 } as const;
 export const EXT_ATTR = EXTENDED_ATTR;
 export const decodeAddress = decodeBufferAddress;
-export function encodeAddress(addr: number, _screenSize: number): Buffer {
+export function encodeAddress(addr: number, screenSize: number): Buffer {
+  // 12-bit encoding addresses at most 4096 positions; larger screens
+  // (none of the standard models, but future partitions) need 14-bit.
+  if (addr > 0x0FFF || screenSize > 0x1000) {
+    const [b1, b2] = encodeBufferAddress14(addr);
+    return Buffer.from([b1, b2]);
+  }
   const [b1, b2] = encodeBufferAddress12(addr);
   return Buffer.from([b1, b2]);
 }

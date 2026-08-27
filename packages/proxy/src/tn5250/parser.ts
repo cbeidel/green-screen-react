@@ -1,7 +1,7 @@
 import { ScreenBuffer, FieldDef, ExtAttr } from './screen.js';
 import { CMD, ORDER, OPCODE, ATTR, WDSF_TYPE, WDSF_CLASS } from './constants.js';
-import { ebcdicToChar, ebcdicSymbolChar, EBCDIC_SPACE } from './ebcdic.js';
-import { SI, SO, decodeDbcsPair } from './ebcdic-jp.js';
+import { ebcdicToChar, ebcdicSymbolChar, EBCDIC_SPACE } from '../encoding/ebcdic.js';
+import { SI, SO, decodeDbcsPair } from '../encoding/ebcdic-jp.js';
 
 /**
  * Parses 5250 data stream records and updates the screen buffer.
@@ -513,6 +513,23 @@ export class TN5250Parser {
         this.screen.setAttrAt(currentAddr, currentAttr);
         this.screen.setExtAttrAt(currentAddr, snapExt());
         this.screen.dbcsCont[currentAddr] = false;
+        this.screen.dbcsShift[currentAddr] = 0;
+      }
+      currentAddr++;
+      if (currentAddr >= this.screen.size) currentAddr = 0;
+    };
+
+    // Helper: write an SO/SI shift-control cell. Renders as a space (per
+    // IBM PCOMM column alignment) but keeps its identity in dbcsShift so
+    // the encoder can re-emit the original 0x0E/0x0F on the wire instead
+    // of a 0x40 space — without this the field loses round-trip identity.
+    const writeShift = (kind: 1 | 2): void => {
+      if (currentAddr < this.screen.size) {
+        this.screen.setCharAt(currentAddr, ' ');
+        this.screen.setAttrAt(currentAddr, currentAttr);
+        this.screen.setExtAttrAt(currentAddr, snapExt());
+        this.screen.dbcsCont[currentAddr] = false;
+        this.screen.dbcsShift[currentAddr] = kind;
       }
       currentAddr++;
       if (currentAddr >= this.screen.size) currentAddr = 0;
@@ -526,6 +543,7 @@ export class TN5250Parser {
         this.screen.setAttrAt(currentAddr, currentAttr);
         this.screen.setExtAttrAt(currentAddr, snapExt());
         this.screen.dbcsCont[currentAddr] = false;
+        this.screen.dbcsShift[currentAddr] = 0;
       }
       currentAddr++;
       if (currentAddr >= this.screen.size) currentAddr = 0;
@@ -534,6 +552,7 @@ export class TN5250Parser {
         this.screen.setAttrAt(currentAddr, currentAttr);
         this.screen.setExtAttrAt(currentAddr, snapExt());
         this.screen.dbcsCont[currentAddr] = true;
+        this.screen.dbcsShift[currentAddr] = 0;
       }
       currentAddr++;
       if (currentAddr >= this.screen.size) currentAddr = 0;
@@ -781,7 +800,13 @@ export class TN5250Parser {
           if (pos + 2 >= data.length) return data.length;
           pos++;
           const wdsfLen = (data[pos] << 8) | data[pos + 1];
-          const wdsfEnd = pos + Math.max(2, wdsfLen);
+          // Clamp the host-supplied length to the actual record BEFORE the
+          // sub-parsers run. Their internal reads (window title/footer, selection
+          // fields, scrollbars) are all guarded relative to `wdsfEnd`, so a host
+          // sending wdsfLen larger than the record would otherwise read past the
+          // buffer (undefined → garbage title/field text). Clamping here is the
+          // single choke point that bounds every WDSF sub-parser.
+          const wdsfEnd = Math.min(pos + Math.max(2, wdsfLen), data.length);
           pos += 2; // past length bytes
 
           if (pos + 1 < data.length) {
@@ -905,14 +930,14 @@ export class TN5250Parser {
             // a space to preserve column alignment (matches IBM PCOMM).
             dbcsMode = true;
             dbcsPending = -1;
-            writeChar(' ');
+            writeShift(1);
             pos++;
           } else if (byte === SI && dbcsMode) {
             // Shift-In: exit DBCS mode, return to SBCS. Any orphan pending
             // byte is discarded (malformed stream). SI also occupies a cell.
             dbcsMode = false;
             dbcsPending = -1;
-            writeChar(' ');
+            writeShift(2);
             pos++;
           } else if (dbcsMode) {
             // Collect DBCS byte pairs. Each pair renders as one full-width
@@ -1135,6 +1160,7 @@ export class TN5250Parser {
       row,
       col,
       length: fieldLength,
+      lengthSource: fieldLength > 0 ? 'declared' : undefined,
       ffw1: inputField ? ffw1 : 0x20, // BYPASS bit for output fields
       ffw2,
       fcw1,
@@ -1177,6 +1203,18 @@ export class TN5250Parser {
         existing.ffw2 = ffw2;
         existing.attribute = fieldDisplayAttr;
         existing.rawAttrByte = rawAttrByte;
+        // The SF order carries the host's DECLARED width. A field synthesized
+        // earlier from a bare SBA+attribute holds length 0, and dropping the
+        // declared length here left it to calculateFieldLengths, which measures
+        // the gap to the next field — so a 6-char date field on a sparse row
+        // reported 43. Integrators sized their input against that and the host
+        // silently truncated the overflow (LegacyBridge, 2026-08-03: an 8-digit
+        // date landed as the wrong YEAR with no error raised).
+        if (fieldLength > 0) {
+          existing.length = fieldLength;
+          existing.lengthSource = 'declared';
+        }
+        existing.synthetic = undefined;
       } else {
         this.screen.fields.push(field);
       }
@@ -1615,7 +1653,10 @@ export class TN5250Parser {
       // If the field already has an explicit length from SF order, keep it
       if (current.length > 0) continue;
 
-      // Otherwise infer length from adjacent field positions (bare field attributes)
+      // Otherwise infer length from adjacent field positions (bare field
+      // attributes). This is a GAP measurement, not the host's field width —
+      // stamped so consumers can refuse to size input against it.
+      current.lengthSource = 'inferred';
       const currentStart = this.screen.offset(current.row, current.col);
 
       if (i + 1 < fields.length) {

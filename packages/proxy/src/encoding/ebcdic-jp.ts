@@ -148,9 +148,27 @@ export const DBCS_SHIFT_INVISIBLE = '';
 /** Registry of additional DBCS mappings loaded at runtime. */
 const DBCS_OVERRIDES = new Map<number, string>();
 
+/**
+ * Reverse registry (Unicode glyph → byte pair), maintained alongside
+ * DBCS_OVERRIDES so the encode side is always the mirror of decode:
+ * decodeDbcsPair(...encodeDbcsPair(ch)) === ch for every registered glyph.
+ */
+const DBCS_ENCODE = new Map<string, number>();
+
+function setDbcsMapping(key: number, unicode: string): void {
+  // Re-registering a key must not leave the old glyph's encode entry
+  // pointing at a pair that now decodes to something else.
+  const prev = DBCS_OVERRIDES.get(key);
+  if (prev !== undefined && DBCS_ENCODE.get(prev) === key) {
+    DBCS_ENCODE.delete(prev);
+  }
+  DBCS_OVERRIDES.set(key, unicode);
+  DBCS_ENCODE.set(unicode, key);
+}
+
 /** Register a single DBCS byte-pair → Unicode mapping. */
 export function registerDbcsMapping(byte1: number, byte2: number, unicode: string): void {
-  DBCS_OVERRIDES.set(((byte1 & 0xFF) << 8) | (byte2 & 0xFF), unicode);
+  setDbcsMapping(((byte1 & 0xFF) << 8) | (byte2 & 0xFF), unicode);
 }
 
 /**
@@ -168,12 +186,12 @@ export function registerDbcsTable(
   table: Record<string, string> | Record<number, string> | Map<number, string>,
 ): void {
   if (table instanceof Map) {
-    for (const [k, v] of table) DBCS_OVERRIDES.set(k, v);
+    for (const [k, v] of table) setDbcsMapping(k, v);
     return;
   }
   for (const [k, v] of Object.entries(table)) {
     const key = /^[0-9a-fA-F]+$/.test(k) ? parseInt(k, 16) : Number(k);
-    if (Number.isFinite(key)) DBCS_OVERRIDES.set(key, v as string);
+    if (Number.isFinite(key)) setDbcsMapping(key, v as string);
   }
 }
 
@@ -197,4 +215,23 @@ export function decodeDbcsPair(byte1: number, byte2: number): string {
 /** Return true if a byte is in the valid DBCS range (0x41-0xFE). */
 export function isValidDbcsByte(byte: number): boolean {
   return byte >= 0x40 && byte <= 0xFE;
+}
+
+/**
+ * Encode a Unicode glyph to its IBM EBCDIC DBCS byte pair.
+ * Mirror of decodeDbcsPair. Returns null for glyphs with no registered
+ * pair — callers choose the on-wire fallback (typically the DBCS space,
+ * which preserves the two-cell layout).
+ */
+export function encodeDbcsPair(ch: string): [number, number] | null {
+  // Full-width space is fixed by the code set, not the runtime table.
+  if (ch === '\u3000') return [0x40, 0x40];
+  const key = DBCS_ENCODE.get(ch);
+  if (key === undefined) return null;
+  return [(key >> 8) & 0xFF, key & 0xFF];
+}
+
+/** Return true if a glyph has a DBCS byte pair (i.e. types as double-byte). */
+export function isDbcsGlyph(ch: string): boolean {
+  return ch === '\u3000' || DBCS_ENCODE.has(ch);
 }

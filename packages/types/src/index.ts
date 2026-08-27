@@ -22,8 +22,16 @@ export interface Field {
   row: number;
   /** 0-based column index */
   col: number;
-  /** Field length in characters */
+  /** Field length in characters.
+   *  When `length_source` is absent this is an INFERRED upper bound (the gap to
+   *  the next field), not the host's field width. */
   length: number;
+  /** Present (`'declared'`) only when `length` is the width the host sent in its
+   *  SF order. Absent means the width was measured from field spacing, which
+   *  routinely over-reports — a trailing field infers to the screen edge. Never
+   *  size input against an undeclared length: a 5250 host silently keeps only
+   *  the first N characters of an over-long write. */
+  length_source?: 'declared';
   /** Whether the field accepts user input */
   is_input: boolean;
   /** Whether the field is protected (read-only) */
@@ -36,8 +44,16 @@ export interface Field {
   is_underscored?: boolean;
   /** Whether the field is non-display (hidden input, e.g. password fields) */
   is_non_display?: boolean;
-  /** 5250 display color derived from the field attribute byte */
+  /** Display color derived from the field attribute byte (5250) or the
+   *  extended color attribute (3270 SFE/SA — COLOR bytes 0xF1–0xF7 map 1:1
+   *  onto this union). */
   color?: FieldColor;
+  /**
+   * Numeric-only input field. 3270: the field-attribute NUMERIC bit.
+   * 5250 exposes the richer `shift_type` instead ('numeric_only' /
+   * 'digits_only' / 'signed_num'); protocols without field typing omit it.
+   */
+  is_numeric?: boolean;
   /**
    * Highlight-on-entry attribute byte (FCW 0x89xx). When the cursor is
    * inside this field, the frontend should apply this attribute instead of
@@ -103,6 +119,16 @@ export interface Field {
    * a TAB after this field (the host already advanced / submitted).
    */
   auto_enter?: boolean;
+  /**
+   * Field Exit Required (FFW2 bit 0x40, DDS CHECK(ER) family) — the host
+   * rejects leaving this field by plain data-fill; a Field Exit-class key must
+   * end it (or the field must fill under auto_enter). Clients that position
+   * the cursor and type directly should plan a FieldExit keystroke after the
+   * value instead of discovering the requirement from a rejected submit.
+   */
+  field_exit_required?: boolean;
+  /** DUP key allowed in this field (FFW1 bit 0x10). */
+  dup_enable?: boolean;
   /**
    * Modified Data Tag (MDT) — true when the operator has typed into this
    * input field since the last host read. Mirrors the 5250 per-field MDT bit

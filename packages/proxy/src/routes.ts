@@ -7,13 +7,13 @@ import {
   getAllSessions,
   gracefullyDestroySession,
 } from './session.js';
-import { TN5250Handler } from './protocols/index.js';
 import {
   broadcastScreenToSession,
   cancelOrphanReapOnRestActivity,
   destroyWsSession,
 } from './websocket.js';
 import { getKeyedSessionId, bindKey, withKeyLock } from './session-keys.js';
+import { validateEgressTarget } from './security.js';
 const router = Router();
 
 /** Build the success payload for a connected session: its id, whether it was
@@ -81,7 +81,7 @@ async function ensureSignedOn(session: Session, username?: string, password?: st
     return;
   }
   if (session.status.status === 'authenticated') return;
-  if (!(session.handler instanceof TN5250Handler)) return;
+  if (!session.handler.performAutoSignIn) return;
   const result = await session.handler.performAutoSignIn(username, password);
   if (result?.authenticated) session.markAuthenticated(username);
 }
@@ -134,6 +134,15 @@ async function typeTextAnimated(session: Session, text: string): Promise<boolean
 router.post('/connect', async (req: Request, res: Response) => {
   try {
     const { host = 'pub400.com', port = 23, protocol = 'tn5250', terminalType, codePage, screenTimeout, connectTimeout, username, password, key, forceNew, deviceName, autoReconnect } = req.body || {};
+
+    // Egress (SSRF) validation BEFORE any socket opens. No-op unless the
+    // integrator enabled GS_PROXY_BLOCK_PRIVATE / GS_PROXY_HOST_ALLOWLIST; always
+    // enforces host is a non-empty string and port is an integer in range.
+    const egress = validateEgressTarget(host, port);
+    if (!egress.ok) {
+      return res.status(400).json({ success: false, error: egress.reason });
+    }
+
     const opts: FreshConnectOpts = { host, port, protocol, terminalType, codePage, screenTimeout, connectTimeout, deviceName, autoReconnect };
 
     // ── Connect-by-key: at most one live session per key ──
@@ -530,18 +539,6 @@ router.post('/batch', async (req: Request, res: Response) => {
     return res.status(400).json({ success: false, error: 'operations array is required' });
   }
 
-  // Local-only keys that don't trigger a host roundtrip
-  const localKeys = new Set([
-    'Tab', 'Backtab', 'TAB', 'BACKTAB',
-    'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown',
-    'LEFT', 'RIGHT', 'UP', 'DOWN',
-    'Home', 'HOME', 'End', 'END',
-    'Backspace', 'BACKSPACE', 'Delete', 'DELETE',
-    'Insert', 'INSERT',
-    'Reset', 'RESET',
-    'FieldExit', 'FIELD_EXIT', 'FIELDEXIT',
-  ]);
-
   let lastRemoteKey = false;
 
   try {
@@ -556,7 +553,7 @@ router.post('/batch', async (req: Request, res: Response) => {
               return res.json({ success: false, error: `Unknown key: ${op.value}` });
             }
           }
-          lastRemoteKey = !localKeys.has(op.value);
+          lastRemoteKey = !session.handler.isLocalKey(op.value);
           break;
 
         case 'text': {
@@ -632,19 +629,6 @@ router.post('/send-text', async (req: Request, res: Response) => {
   });
 });
 
-// Keys that are handled locally in the screen buffer (no host roundtrip needed).
-// Must match the set in controller.ts handleKey() for consistent behavior.
-const LOCAL_KEYS = new Set([
-  'Tab', 'Backtab', 'TAB', 'BACKTAB',
-  'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown',
-  'LEFT', 'RIGHT', 'UP', 'DOWN',
-  'Home', 'HOME', 'End', 'END',
-  'Backspace', 'BACKSPACE', 'Delete', 'DELETE',
-  'Insert', 'INSERT',
-  'Reset', 'RESET',
-  'FieldExit', 'FIELD_EXIT', 'FIELDEXIT',
-]);
-
 // POST /send-key
 router.post('/send-key', async (req: Request, res: Response) => {
   const session = resolveSession(req);
@@ -657,9 +641,14 @@ router.post('/send-key', async (req: Request, res: Response) => {
     return res.status(400).json({ success: false, error: 'key is required' });
   }
 
-  if (!LOCAL_KEYS.has(key)) {
-    // Remote key: race-free send + wait (listener set up before sendKey)
-    const { ok, screen } = await session.sendKeyAndWait(key, session.screenTimeout);
+  if (!session.handler.isLocalKey(key)) {
+    // Remote key: race-free send + wait (listener set up before sendKey).
+    // Stream protocols echo per keystroke (or not at all) — cap the wait
+    // so typing stays snappy without an echo.
+    const keyWaitMs = session.handler.traits.inputModel === 'stream'
+      ? Math.min(300, session.screenTimeout)
+      : session.screenTimeout;
+    const { ok, screen } = await session.sendKeyAndWait(key, keyWaitMs);
     if (!ok) {
       return res.json({ success: false, error: `Unknown key: ${key}` });
     }

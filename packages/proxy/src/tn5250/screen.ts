@@ -1,6 +1,7 @@
 import { createHash } from 'crypto';
 import { SCREEN } from './constants.js';
-import type { EbcdicCodePage } from './ebcdic.js';
+import type { EbcdicCodePage } from '../encoding/ebcdic.js';
+import { isDbcsGlyph } from '../encoding/ebcdic-jp.js';
 import type { ScreenData, Field, CellExtAttr } from 'green-screen-types';
 import { computeStructuralSignature } from '../structural-signature.js';
 import { computeScreenId } from './screen-id.js';
@@ -28,6 +29,7 @@ interface SavedScreenState {
   attrBuffer: number[];
   extAttrBuffer: (ExtAttr | null)[];
   dbcsCont: boolean[];
+  dbcsShift: number[];
   fields: FieldDef[];
   cursorRow: number;
   cursorCol: number;
@@ -64,6 +66,19 @@ export interface FieldDef {
    *  Input-vs-protected inference is heuristic — validated in
    *  calculateFieldLengths against same-row termination. */
   synthetic?: boolean;
+  /** Where `length` came from.
+   *
+   *  'declared' — the 2-byte length the host sent in its SF order. Authoritative:
+   *  it is the width the host program will actually accept.
+   *
+   *  'inferred' — calculateFieldLengths measured the gap to the next field
+   *  because no SF length was available. An upper bound, often far larger than
+   *  the real field (a trailing field infers everything to the screen edge).
+   *
+   *  Integrators MUST NOT size input against an inferred length: a host silently
+   *  keeps only the first N characters of an over-long write, so an inflated
+   *  width turns a rejected value into a corrupted one. */
+  lengthSource?: 'declared' | 'inferred';
   /** Part of a continued (multi-line wrapping) field group. Per lib5250 field.h:66-70. */
   continuous?: boolean;
   /** First subfield of a continued field group (FCW 0x8601). */
@@ -158,6 +173,13 @@ export class ScreenBuffer {
    * the second cell is rendered as empty but reserved for layout.
    */
   dbcsCont: boolean[];
+  /**
+   * DBCS shift-control marker per cell: 0 = none, 1 = Shift-Out (0x0E),
+   * 2 = Shift-In (0x0F). SO/SI occupy screen cells (rendered as spaces)
+   * — without this mark their cells re-encode as 0x40 and the field loses
+   * round-trip identity on the wire.
+   */
+  dbcsShift: number[];
   /** EBCDIC single-byte code page used to decode/encode character data. */
   codePage: EbcdicCodePage = 'cp37';
   fields: FieldDef[] = [];
@@ -222,6 +244,7 @@ export class ScreenBuffer {
     this.attrBuffer = new Array(size).fill(0x20); // normal
     this.extAttrBuffer = new Array(size).fill(null);
     this.dbcsCont = new Array(size).fill(false);
+    this.dbcsShift = new Array(size).fill(0);
   }
 
   get size(): number {
@@ -237,6 +260,7 @@ export class ScreenBuffer {
     this.attrBuffer = new Array(size).fill(0x20);
     this.extAttrBuffer = new Array(size).fill(null);
     this.dbcsCont = new Array(size).fill(false);
+    this.dbcsShift = new Array(size).fill(0);
     this.fields = [];
     this.cursorRow = 0;
     this.cursorCol = 0;
@@ -304,6 +328,7 @@ export class ScreenBuffer {
     this.attrBuffer.fill(0x20);
     this.extAttrBuffer.fill(null);
     this.dbcsCont.fill(false);
+    this.dbcsShift.fill(0);
     this.fields = [];
     this.selectionFields = [];
     this.cursorRow = 0;
@@ -324,6 +349,7 @@ export class ScreenBuffer {
     this.attrBuffer = new Array(size).fill(0x20);
     this.extAttrBuffer = new Array(size).fill(null);
     this.dbcsCont = new Array(size).fill(false);
+    this.dbcsShift = new Array(size).fill(0);
     this.fields = [];
     this.cursorRow = 0;
     this.cursorCol = 0;
@@ -361,19 +387,109 @@ export class ScreenBuffer {
     }
   }
 
-  /** Get the content of a field as a string */
+  /**
+   * Get the content of a field as its logical string. Cell-honest for
+   * DBCS: SO/SI cells are shift structure, not content, and continuation
+   * cells (empty string) contribute nothing — so a field holding
+   * SO+漢+cont+SI reads back as "漢". SBCS fields are unchanged (join).
+   */
   getFieldValue(field: FieldDef): string {
     const start = this.offset(field.row, field.col);
-    return this.buffer.slice(start, start + field.length).join('');
+    let out = '';
+    for (let i = 0; i < field.length && start + i < this.size; i++) {
+      const addr = start + i;
+      if (this.dbcsShift[addr]) continue;
+      out += this.buffer[addr];
+    }
+    return out;
   }
 
-  /** Set the content of a field */
+  /** True if any FCW marks the field as DBCS-accepting. */
+  isDbcsField(field: FieldDef): boolean {
+    return !!(field.ideographicOnly || field.ideographicData
+      || field.ideographicOpen || field.ideographicEither);
+  }
+
+  /**
+   * True if the field's DBCS data carries SO/SI shift markers on screen.
+   * Ideographic OPEN and EITHER fields bracket DBCS runs with SO/SI;
+   * ideographic-ONLY / DATA fields hold bare byte pairs.
+   */
+  fieldUsesShiftMarks(field: FieldDef): boolean {
+    return !!(field.ideographicOpen || field.ideographicEither);
+  }
+
+  /**
+   * Set the content of a field. Cell-honest: a DBCS glyph occupies a
+   * glyph cell + continuation cell (plus SO/SI shift cells on shifted
+   * fields); every written cell's cont/shift marks are made consistent.
+   */
   setFieldValue(field: FieldDef, value: string): void {
     const start = this.offset(field.row, field.col);
+
+    if (this.isDbcsField(field)) {
+      const cells = this.layoutDbcsCells(field, value);
+      for (let i = 0; i < field.length; i++) {
+        const c = i < cells.length ? cells[i] : null;
+        this.buffer[start + i] = c ? c.ch : ' ';
+        this.dbcsCont[start + i] = !!c?.cont;
+        this.dbcsShift[start + i] = c?.shift ?? 0;
+      }
+      this.setFieldMdt(field);
+      return;
+    }
+
     for (let i = 0; i < field.length; i++) {
       this.buffer[start + i] = i < value.length ? value[i] : ' ';
+      this.dbcsCont[start + i] = false;
+      this.dbcsShift[start + i] = 0;
     }
     this.setFieldMdt(field);
+  }
+
+  /**
+   * Lay a logical string out as screen cells for a DBCS-capable field:
+   * glyph + continuation pairs, SO/SI brackets on shifted fields, and a
+   * truncation that never splits a pair or drops a closing SI.
+   */
+  private layoutDbcsCells(
+    field: FieldDef,
+    value: string,
+  ): { ch: string; cont?: boolean; shift?: number }[] {
+    const shifted = this.fieldUsesShiftMarks(field);
+    const cells: { ch: string; cont?: boolean; shift?: number }[] = [];
+    let inDbcs = false;
+    for (const ch of value) {
+      if (isDbcsGlyph(ch)) {
+        if (!inDbcs && shifted) cells.push({ ch: ' ', shift: 1 });
+        inDbcs = true;
+        cells.push({ ch });
+        cells.push({ ch: '', cont: true });
+      } else {
+        if (inDbcs && shifted) cells.push({ ch: ' ', shift: 2 });
+        inDbcs = false;
+        cells.push({ ch });
+      }
+    }
+    if (inDbcs && shifted) cells.push({ ch: ' ', shift: 2 });
+
+    if (cells.length > field.length) {
+      const endsSI = shifted && cells[cells.length - 1].shift === 2;
+      if (endsSI) cells.pop();
+      const budget = field.length - (endsSI ? 1 : 0);
+      while (cells.length > budget) {
+        const c = cells.pop();
+        if (c?.cont) cells.pop(); // a pair leaves or stays whole
+      }
+      if (endsSI) {
+        if (cells.length && cells[cells.length - 1].shift === 1) {
+          cells.pop(); // run truncated to nothing — drop its SO too
+        } else {
+          cells.push({ ch: ' ', shift: 2 });
+        }
+      }
+    }
+    return cells;
   }
 
   /**
@@ -558,15 +674,27 @@ export class ScreenBuffer {
     }
   }
 
+  /** Upper bound on SAVE_SCREEN nesting. Real host flows nest a handful deep;
+   *  the cap only exists so a host spamming SAVE_SCREEN (each entry is a full
+   *  deep copy of buffer + attrs + fields) can't grow the stack unbounded and
+   *  exhaust memory. RESTORE pops LIFO, so when the cap is hit we drop the
+   *  OLDEST entry — realistic nesting is preserved, only a pathological flood
+   *  loses its deepest-buried frames. */
+  static MAX_SCREEN_STACK = 16;
+
   /** Save current screen state to the stack.
    *  Per lib5250 session.c:1377-1404: saves display buffer, fields, cursor,
    *  and read state so they can be restored later. */
   saveState(): void {
+    if (this.screenStack.length >= ScreenBuffer.MAX_SCREEN_STACK) {
+      this.screenStack.shift();
+    }
     this.screenStack.push({
       buffer: [...this.buffer],
       attrBuffer: [...this.attrBuffer],
       extAttrBuffer: this.extAttrBuffer.map(e => (e ? { ...e } : null)),
       dbcsCont: [...this.dbcsCont],
+      dbcsShift: [...this.dbcsShift],
       fields: this.fields.map(f => ({ ...f })),
       cursorRow: this.cursorRow,
       cursorCol: this.cursorCol,
@@ -587,6 +715,7 @@ export class ScreenBuffer {
     this.attrBuffer = state.attrBuffer;
     this.extAttrBuffer = state.extAttrBuffer;
     this.dbcsCont = state.dbcsCont;
+    this.dbcsShift = state.dbcsShift ?? new Array(this.size).fill(0);
     this.fields = state.fields;
     this.cursorRow = state.cursorRow;
     this.cursorCol = state.cursorCol;
@@ -909,6 +1038,14 @@ export class ScreenBuffer {
         else if (adjustBits === 0x07) auto_adjust = 'mandatory_fill';
       }
       const mandatory_entry = isInput && (f.ffw2 & 0x08) !== 0;
+      // FFW2 bit 0x40 = FIELD EXIT REQUIRED (DDS CHECK(ER) family): the host
+      // rejects leaving the field by plain data-fill — a Field Exit-class key
+      // (or the field filling under AUTO-ENTER) must end it. Surfaced so a
+      // client can plan a FieldExit keystroke instead of learning the
+      // requirement from a rejected submit.
+      const field_exit_required = isInput && (f.ffw2 & 0x40) !== 0;
+      // FFW1 bit 0x10 = DUP key allowed in this field.
+      const dup_enable = isInput && (f.ffw1 & 0x10) !== 0;
       // FFW2 bit 0x80 = AUTO-ENTER (DDS AUTO(RA/RAB)): the field implicitly sends
       // ENTER once it fills, so a client that walks fields with explicit TAB must
       // NOT add a TAB after it (the host already advanced). Protocol-generic.
@@ -917,6 +1054,10 @@ export class ScreenBuffer {
         row: f.row,
         col: f.col,
         length: f.length,
+        // Provenance of `length`. Emitted only when the host DECLARED it, so a
+        // consumer can size input against a real width and fall back to
+        // treating `length` as an upper bound otherwise.
+        length_source: f.lengthSource === 'declared' ? 'declared' : undefined,
         is_input: isInput,
         is_protected: !isInput,
         is_highlighted: this.isHighlighted(f) || undefined,
@@ -937,6 +1078,8 @@ export class ScreenBuffer {
         auto_adjust,
         mandatory_entry: mandatory_entry || undefined,
         auto_enter: auto_enter || undefined,
+        field_exit_required: field_exit_required || undefined,
+        dup_enable: dup_enable || undefined,
         // MDT bit — only meaningful for input fields; leave undefined on
         // protected fields to keep the wire payload minimal.
         modified: isInput && f.modified ? true : undefined,
