@@ -91,6 +91,28 @@ class ScreenBuffer:
     def _field_to_dict(field) -> dict:  # type: ignore[no-untyped-def]
         # Reconstruct a dict shape that legacy code expects, including the
         # conventional 5250 'attr' byte (bit 0x08 = protected).
+        #
+        # This projection is LOSSLESS BY CONTRACT: every attribute ``Field``
+        # carries must appear here, because this dict — not the ``Field`` — is
+        # what integrators consume, and a key omitted here is indistinguishable
+        # from a host that never sent it.
+        #
+        # Six attributes were dropped for months. The one with teeth is
+        # ``is_numeric``: it is the TN3270 field-attribute NUMERIC bit, and on
+        # 3270 it is the ONLY numeric signal, so a numeric-field predicate had
+        # nothing to read there. (TN5250 was unaffected — it sends the richer
+        # ``shift_type``, which was projected.) ``auto_enter`` and
+        # ``field_exit_required`` are diagnostic metadata by design, NOT
+        # enforcement: AUTO(RA/RAB) and CHECK(ER) are keyboard-device
+        # behaviours, and programmatic buffer writes never fire an AID, so a
+        # client must not act on them — dropping those two lost visibility, not
+        # behaviour. ``dup_enable``, ``is_dbcs_either`` and ``pointer_aid`` had
+        # no consumer at all; they are here because the contract is lossless,
+        # not because something was broken.
+        #
+        # ``test_buffer.py`` pins that contract structurally against
+        # ``dataclasses.fields(Field)``, so a newly added attribute fails the
+        # suite until it is projected here too.
         attr = 0x28 if field.is_protected else 0x20
         if field.is_highlighted:
             attr |= 0x02
@@ -98,6 +120,7 @@ class ScreenBuffer:
             "row": field.row,
             "col": field.col,
             "length": field.length,
+            "length_source": getattr(field, "length_source", None),
             "attr": attr,
             "is_input": field.is_input,
             "is_protected": field.is_protected,
@@ -110,11 +133,24 @@ class ScreenBuffer:
             "shift_type": field.shift_type,
             "monocase": bool(field.monocase),
             "auto_adjust": getattr(field, "auto_adjust", None),
+            # FFW2 AUTO(RA/RAB): the field implicitly ENTERs once it fills, so a
+            # client walking fields with TAB must not add a TAB after it.
+            "auto_enter": bool(getattr(field, "auto_enter", None) or False),
+            # FFW2 CHECK(ER) family: the host refuses a plain data-fill exit —
+            # plan a Field Exit keystroke rather than learn it from a rejection.
+            "field_exit_required": bool(
+                getattr(field, "field_exit_required", None) or False),
+            # FFW1 DUP-enable: the DUP key is permitted in this field.
+            "dup_enable": bool(getattr(field, "dup_enable", None) or False),
+            # 3270 field-attribute NUMERIC bit (5250 sends the richer shift_type).
+            "is_numeric": bool(getattr(field, "is_numeric", None) or False),
             "is_dbcs": bool(field.is_dbcs),
+            "is_dbcs_either": bool(getattr(field, "is_dbcs_either", None) or False),
             "self_check_mod10": bool(field.self_check_mod10),
             "self_check_mod11": bool(field.self_check_mod11),
             "resequence": field.resequence,
             "progression_id": field.progression_id,
+            "pointer_aid": getattr(field, "pointer_aid", None),
             "highlight_entry_attr": field.highlight_entry_attr,
             "modified": bool(field.modified) if field.modified is not None else False,
         }
@@ -149,6 +185,9 @@ class ProxyTerminalClient:
         auto_reconnect: Optional[bool] = None,
         timeout: float = 30.0,
         auth_token: Optional[str] = None,
+        tls: Optional[bool] = None,
+        tls_verify: Optional[bool] = None,
+        ca_cert: Optional[str] = None,
     ) -> None:
         # Bearer token forwarded to REST + WS when the proxy runs with
         # GS_PROXY_AUTH_TOKEN. None ⇒ unauthenticated proxy (legacy default).
@@ -163,6 +202,12 @@ class ProxyTerminalClient:
         self._device_name = device_name
         # Opt in to proxy-driven recovery (see ConnectConfig.auto_reconnect).
         self._auto_reconnect = auto_reconnect
+        # Telnet-over-TLS (see ConnectConfig.tls — capability preflight +
+        # security-echo assertion happen in RestClient.connect; both are hard
+        # errors, never a plaintext degrade).
+        self._tls = tls
+        self._tls_verify = tls_verify
+        self._ca_cert = ca_cert
         self.screen = ScreenBuffer()
         self._connected = False
         self._error_message: Optional[str] = None
@@ -199,6 +244,9 @@ class ProxyTerminalClient:
                 code_page=self._code_page,
                 device_name=self._device_name,
                 auto_reconnect=self._auto_reconnect,
+                tls=self._tls,
+                tls_verify=self._tls_verify,
+                ca_cert=self._ca_cert,
                 connect_timeout=int(self._rest._timeout * 1000),
                 key=key,
                 force_new=force_new,
@@ -235,6 +283,9 @@ class ProxyTerminalClient:
                 code_page=self._code_page,
                 device_name=self._device_name,
                 auto_reconnect=self._auto_reconnect,
+                tls=self._tls,
+                tls_verify=self._tls_verify,
+                ca_cert=self._ca_cert,
                 username=username,
                 password=password,
                 connect_timeout=int(self._rest._timeout * 1000),

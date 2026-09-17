@@ -10,6 +10,12 @@ export class Session extends EventEmitter {
   readonly handler: ProtocolHandler;
   readonly protocol: ProtocolType;
 
+  /** The auth scope this session was created under (see security.resolveAuth).
+   *  ``null`` = created by an unscoped/all-access caller (base token or auth
+   *  disabled). A scoped caller may only see/drive sessions whose scope equals
+   *  its own; this is the proxy's multi-tenant isolation tag. Opaque here. */
+  scope: string | null = null;
+
   private _status: ConnectionStatus = { connected: false, status: 'disconnected' };
   private _host: string = '';
   private _port: number = 23;
@@ -94,6 +100,13 @@ export class Session extends EventEmitter {
       sessionLifecycle.emit('session.lost', this.id, this._status);
     });
     this.handler.on('error', (err: Error) => {
+      // A fatal protocol verdict (the host refused our device name) is not a
+      // drop to recover from: re-establishing TCP would only replay the same
+      // refusal. Treat it as an intentional close so auto-reconnect stands
+      // down and the session reports lost with the error attached.
+      if ((err as Error & { fatal?: boolean }).fatal) {
+        this._intentionalClose = true;
+      }
       this._status = { connected: false, status: 'error', protocol: this.protocol, host: this._host, error: err.message };
       this.emit('statusChange', this._status);
       // For an autoReconnect session, let the ensuing disconnect drive recovery
@@ -405,8 +418,9 @@ export class Session extends EventEmitter {
 // in-memory). Integrators can swap the store via setSessionStore() before
 // any routes/websockets are mounted.
 
-export function createSession(protocol: ProtocolType = 'tn5250'): Session {
+export function createSession(protocol: ProtocolType = 'tn5250', scope: string | null = null): Session {
   const session = new Session(protocol);
+  session.scope = scope;
   getSessionStore().set(session.id, session);
   return session;
 }

@@ -28,7 +28,7 @@ export interface Field {
   length: number;
   /** Present (`'declared'`) only when `length` is the width the host sent in its
    *  SF order. Absent means the width was measured from field spacing, which
-   *  routinely over-reports — a trailing field infers to the screen edge. Never
+   *  routinely over-reports — a trailing field infers to the end of its row. Never
    *  size input against an undeclared length: a 5250 host silently keeps only
    *  the first N characters of an over-long write. */
   length_source?: 'declared';
@@ -339,4 +339,17 @@ export interface ConnectConfig {
    * If omitted, the proxy derives it from the terminal type.
    */
   codePage?: 'cp37' | 'cp290';
+  /**
+   * Telnet-over-TLS to the host (IBM i "Telnet SSL", conventionally port
+   * 992). The proxy completes the handshake before any telnet byte flows;
+   * a handshake failure fails the connect — never a plaintext fallback.
+   * Clients that REQUIRE TLS should probe the proxy's `/status`
+   * `capabilities` for 'tls' first and assert the connect response's
+   * `security.tls` echo (actual socket state, never request-echoed).
+   */
+  tls?: boolean;
+  /** Verify the host certificate chain (default true). */
+  tlsVerify?: boolean;
+  /** PEM CA (or the host's self-signed cert) to trust for verification. */
+  caCert?: string;
 }
